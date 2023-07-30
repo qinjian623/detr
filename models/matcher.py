@@ -58,8 +58,7 @@ class HungarianMatcher(nn.Module):
         out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
 
-        print(out_bbox)
-        exit()
+
 
         # Also concat the target labels and boxes
         tgt_ids = torch.cat([v["labels"] for v in targets])
@@ -73,9 +72,15 @@ class HungarianMatcher(nn.Module):
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
+        out_bbox_xy = box_cxcywh_to_xyxy(out_bbox)
+        if not (out_bbox_xy[:, 2:] >= out_bbox_xy[:, :2]).all():
+            valid_mask = out_bbox_xy[:, 2:] < out_bbox_xy[:, :2]
+            valid_mask = valid_mask[:, 0] + valid_mask[:, 1]
+            print(out_bbox[valid_mask])
+
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(
-            box_cxcywh_to_xyxy(out_bbox),
+            out_bbox_xy,
             box_cxcywh_to_xyxy(tgt_bbox)
         )
 

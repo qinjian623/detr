@@ -48,7 +48,15 @@ def generalized_box_iou(boxes1, boxes2):
     """
     # degenerate boxes gives inf / nan results
     # so do an early check
-    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+    """
+    if not ((boxes1[:, 2:] >= boxes1[:, :2]).all()):
+        print((boxes1[:, 2:] >= boxes1[:, :2]).all())
+        for b in boxes1:
+            print(b, (b[2] < b[0] or b[3] < b[1]).cpu().item())
+        exit()
+    """
+    assert boxes1.isnan().sum() == 0, "boxes1 nan: {}".format(boxes1.isnan().sum())
+    assert (boxes1[:, 2:] >= boxes1[:, :2]).all(), "boxes: {}".format(boxes1)
     assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
     iou, union = box_iou(boxes1, boxes2)
 

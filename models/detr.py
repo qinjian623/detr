@@ -2,11 +2,14 @@
 """
 DETR model and criterion classes.
 """
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from util import box_ops
+from util.box_ops import box_cxcywh_to_xyxy
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized)
@@ -76,19 +79,36 @@ class DETR(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
-        d2_conf = F.sigmoid(self.d2_conf(features[-1].tensors)) - 0.5
+        filter_logits = self.d2_conf(features[-1].tensors)
         src, mask = features[-1].decompose()
         # print(d2_conf.min(), d2_conf.max())
-        thres = d2_conf.min() + (d2_conf.max() - d2_conf.min()) * 0.5
-        # print(thres)
-        mask = (d2_conf < thres).squeeze(1)
-        # print(mask.sum(), mask.shape)
+
+        bs, c, h, w = filter_logits.shape
+
+        filter_logits_unbatched = filter_logits.reshape(bs, -1)
+        thres = filter_logits_unbatched.min(dim=1)[0] + (
+                filter_logits_unbatched.max(dim=1)[0] - filter_logits_unbatched.min(dim=1)[0]) * 0.5
+
+        # print(thres.shape, filter_logits.shape)
+        mask = (filter_logits.reshape(bs, -1) < thres.reshape(bs, 1)).reshape(bs, h, w)  # .squeeze(1)
+        # for b in range(mask.shape[0]):
+        #     m = mask[b]
+        #     print(m.sum(),
+        #           m.shape[0] * m.shape[1],
+        #           m.shape,
+        #           thres.detach().cpu().item(),
+        #           filter_logits[0].min().detach().cpu().item(),
+        #           filter_logits[0].max().detach().cpu().item())
         assert mask is not None
+
+        # src, mask = features[-1].decompose()
+
+
         hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
 
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'filter_mask': filter_logits}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         return out
@@ -126,6 +146,7 @@ class SetCriterion(nn.Module):
         self.losses = losses
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
+
         self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
@@ -149,14 +170,42 @@ class SetCriterion(nn.Module):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
-    def loss_filter(self, outputs, targets):
+    def loss_filter(self, outputs, targets, indices, num_boxes):
+        assert "filter_mask" in outputs, "filter mask not in outputs {}".format(outputs.keys())
         pred_filter = outputs["filter_mask"]
         device = pred_filter.device
         bs = len(targets)
         assert pred_filter.shape[0] == bs
+        assert isinstance(pred_filter, torch.Tensor)
+        _, _, h, w = pred_filter.shape
+        filter_featmap = torch.zeros_like(pred_filter)
+        for i, t in enumerate(targets):
+            boxes = t["boxes"]
+            boxes_xy = box_cxcywh_to_xyxy(boxes)
+            boxes_xy[:, 0::2] *= w
+            boxes_xy[:, 1::2] *= h
+            boxes_xy = boxes_xy.floor().long()
+            for box in boxes_xy:
+                box[0] = torch.clamp(box[0], min=0, max=w - 1)
+                box[1] = torch.clamp(box[1], min=0, max=h - 1)
+                box[2] = torch.clamp(box[2], min=0, max=w - 1)
+                box[3] = torch.clamp(box[3], min=0, max=h - 1)
 
-        target_filter = torch.cat([t["mask"] for t in targets], dim=0)
+                filter_featmap[i][0][box[1]: box[3] + 1, box[0]:box[2] + 1] = 1.0
 
+            # print(t)
+            # image_id = t["image_id"].item()
+            # import cv2
+            # import shutil
+            # cv2.imwrite(str(image_id) + ".png", filter_featmap[i][0].detach().cpu().numpy() * 255)
+            # torch.save(filter_featmap[i], str(image_id) + ".pt")
+            # shutil.copy("/home/jian/dataset/coco/train2017/000000{}.jpg".format(image_id), str(image_id) + ".jpg")
+
+
+        loss_filter = F.binary_cross_entropy_with_logits(pred_filter, filter_featmap,
+                                                         pos_weight=torch.tensor(5.0, device=device))
+        # exit()
+        return {"loss_filter": loss_filter}
 
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
@@ -239,7 +288,9 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
+            'filter': self.loss_filter,
+
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -266,6 +317,8 @@ class SetCriterion(nn.Module):
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
+            # if loss == "filter":
+            #     continue
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -275,6 +328,8 @@ class SetCriterion(nn.Module):
                 for loss in self.losses:
                     if loss == 'masks':
                         # Intermediate masks losses are too costly to compute, we ignore them.
+                        continue
+                    if loss == 'filter':
                         continue
                     kwargs = {}
                     if loss == 'labels':
@@ -376,7 +431,7 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality']
+    losses = ['labels', 'boxes', 'cardinality', 'filter']
     if args.masks:
         losses += ["masks"]
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
