@@ -18,8 +18,24 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
 from .transformer import build_transformer
 
 
+class D2Conf(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.nn = nn.Sequential(
+            nn.Conv2d(in_channels, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, 1),
+        )
+
+    def forward(self, x):
+        return self.nn(x)
+
+
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
+
     def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
         """ Initializes the model.
         Parameters:
@@ -40,6 +56,7 @@ class DETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
+        self.d2_conf = D2Conf(backbone.num_channels)
 
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -59,8 +76,13 @@ class DETR(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
-
+        d2_conf = F.sigmoid(self.d2_conf(features[-1].tensors)) - 0.5
         src, mask = features[-1].decompose()
+        # print(d2_conf.min(), d2_conf.max())
+        thres = d2_conf.min() + (d2_conf.max() - d2_conf.min()) * 0.5
+        # print(thres)
+        mask = (d2_conf < thres).squeeze(1)
+        # print(mask.sum(), mask.shape)
         assert mask is not None
         hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
 
@@ -86,6 +108,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
+
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
         """ Create the criterion.
         Parameters:
@@ -125,6 +148,15 @@ class SetCriterion(nn.Module):
             # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
+
+    def loss_filter(self, outputs, targets):
+        pred_filter = outputs["filter_mask"]
+        device = pred_filter.device
+        bs = len(targets)
+        assert pred_filter.shape[0] == bs
+
+        target_filter = torch.cat([t["mask"] for t in targets], dim=0)
+
 
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
@@ -257,6 +289,7 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
+
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
         """ Perform the computation

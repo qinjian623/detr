@@ -34,7 +34,7 @@ def detr_resnet50(pretrained=False, num_classes=91, return_postprocessor=False):
         checkpoint = torch.hub.load_state_dict_from_url(
             url="https://dl.fbaipublicfiles.com/detr/detr-r50-e632da11.pth", map_location="cpu", check_hash=True
         )
-        model.load_state_dict(checkpoint["model"])
+        model.load_state_dict(checkpoint["model"], strict=False)
     if return_postprocessor:
         return model, PostProcess()
     return model
