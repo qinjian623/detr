@@ -181,6 +181,12 @@ class SetCriterion(nn.Module):
         filter_featmap = torch.zeros_like(pred_filter)
         for i, t in enumerate(targets):
             boxes = t["boxes"]
+            for box in boxes:
+                cx, cy, _, _ = box
+                cx = (cx * w).floor().long()
+                cy = (cy * h).floor().long()
+                filter_featmap[i][0][cy-1:cy+2, cx-1:cx+2] = 1
+            """
             boxes_xy = box_cxcywh_to_xyxy(boxes)
             boxes_xy[:, 0::2] *= w
             boxes_xy[:, 1::2] *= h
@@ -190,16 +196,17 @@ class SetCriterion(nn.Module):
                 box[1] = torch.clamp(box[1], min=0, max=h - 1)
                 box[2] = torch.clamp(box[2], min=0, max=w - 1)
                 box[3] = torch.clamp(box[3], min=0, max=h - 1)
-
                 filter_featmap[i][0][box[1]: box[3] + 1, box[0]:box[2] + 1] = 1.0
+            """
 
-            # print(t)
-            # image_id = t["image_id"].item()
-            # import cv2
-            # import shutil
-            # cv2.imwrite(str(image_id) + ".png", filter_featmap[i][0].detach().cpu().numpy() * 255)
-            # torch.save(filter_featmap[i], str(image_id) + ".pt")
-            # shutil.copy("/home/jian/dataset/coco/train2017/000000{}.jpg".format(image_id), str(image_id) + ".jpg")
+        #     print(t)
+        #     image_id = t["image_id"].item()
+        #     import cv2
+        #     import shutil
+        #     cv2.imwrite(str(image_id) + ".png", filter_featmap[i][0].detach().cpu().numpy() * 255)
+        #     torch.save(filter_featmap[i], str(image_id) + ".pt")
+        #     shutil.copy("/home/jian/dataset/coco/train2017/000000{}.jpg".format(image_id), str(image_id) + ".jpg")
+        # exit()
 
 
         loss_filter = F.binary_cross_entropy_with_logits(pred_filter, filter_featmap,
